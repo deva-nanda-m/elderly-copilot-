@@ -7,16 +7,56 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+import 'services/local_storage_service.dart';
+import 'screens/auth_screen.dart';
+
 void main() {
   runApp(const ElderCareApp());
 }
 
 // ============================================================
-// APP
+// APP - WITH SESSION RESTORATION & AUTH STATE
 // ============================================================
 
-class ElderCareApp extends StatelessWidget {
+class ElderCareApp extends StatefulWidget {
   const ElderCareApp({super.key});
+
+  @override
+  State<ElderCareApp> createState() => _ElderCareAppState();
+}
+
+class _ElderCareAppState extends State<ElderCareApp> {
+  bool isCheckingSession = true;
+  Map<String, String>? activeSession;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkActiveSession();
+  }
+
+  Future<void> _checkActiveSession() async {
+    final session = await LocalStorageService.getActiveSession();
+    if (mounted) {
+      setState(() {
+        activeSession = session;
+        isCheckingSession = false;
+      });
+    }
+  }
+
+  void _onAuthenticated(Map<String, String> session) {
+    setState(() {
+      activeSession = session;
+    });
+  }
+
+  void _onLogout() {
+    setState(() {
+      activeSession = null;
+    });
+    LocalStorageService.clearSession();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -31,7 +71,23 @@ class ElderCareApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFFF4F8F6),
         fontFamily: 'Arial',
       ),
-      home: const ElderCareHome(),
+      home: isCheckingSession
+          ? const Scaffold(
+              backgroundColor: Color(0xFF0D1B1E),
+              body: Center(
+                child: CircularProgressIndicator(color: Color(0xFF4D8F80)),
+              ),
+            )
+          : (activeSession == null
+              ? AuthScreen(
+                  key: const ValueKey('auth_screen'),
+                  onAuthenticated: _onAuthenticated,
+                )
+              : ElderCareHome(
+                  key: ValueKey('elder_${activeSession!['elder_id']}'),
+                  session: activeSession!,
+                  onLogout: _onLogout,
+                )),
     );
   }
 }
@@ -59,7 +115,14 @@ class ChatMessage {
 // ============================================================
 
 class ElderCareHome extends StatefulWidget {
-  const ElderCareHome({super.key});
+  final Map<String, String> session;
+  final VoidCallback onLogout;
+
+  const ElderCareHome({
+    super.key,
+    required this.session,
+    required this.onLogout,
+  });
 
   @override
   State<ElderCareHome> createState() => _ElderCareHomeState();
@@ -106,6 +169,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
   bool isSubmittingVoice = false;
   bool speechEnabled = false;
   String speechLocaleId = 'ml_IN';
+  int _speechToken = 0;
 
   // ----------------------------------------------------------
   // FASTAPI BACKEND URLS & SESSION
@@ -114,8 +178,46 @@ class _ElderCareHomeState extends State<ElderCareHome>
   static const String baseUrl = "http://127.0.0.1:8000";
   static const String chatUrl = "$baseUrl/chat";
 
-  final String elderId = "elder_001";
+  String get elderId => widget.session['elder_id'] ?? 'elder_default';
+  String get elderName => widget.session['name'] ?? 'അപ്പൂപ്പൻ';
+  String get token => widget.session['token'] ?? '';
   late final String sessionId;
+
+  // ==========================================================
+  // LOCAL HISTORY PERSISTENCE
+  // ==========================================================
+
+  Future<void> _loadLocalHistory() async {
+    final cached = await LocalStorageService.getLocalChatHistory(elderId);
+    if (cached.isNotEmpty && mounted) {
+      setState(() {
+        messages.clear();
+        for (final item in cached) {
+          messages.add(
+            ChatMessage(
+              text: item['text'] ?? '',
+              isUser: item['is_user'] == true,
+              audioUrl: item['audio_url'],
+              timestamp: item['timestamp'] != null
+                  ? DateTime.tryParse(item['timestamp']) ?? DateTime.now()
+                  : DateTime.now(),
+            ),
+          );
+        }
+      });
+      scrollToBottom();
+    }
+  }
+
+  void _persistLocalHistory() {
+    final list = messages.map((m) => {
+      'text': m.text,
+      'is_user': m.isUser,
+      'audio_url': m.audioUrl,
+      'timestamp': m.timestamp.toIso8601String(),
+    }).toList();
+    LocalStorageService.saveLocalChatHistory(elderId, list);
+  }
 
   // ==========================================================
   // INIT
@@ -125,6 +227,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
   void initState() {
     super.initState();
     sessionId = "session_${DateTime.now().millisecondsSinceEpoch}";
+    _loadLocalHistory();
 
     // Robot breathing and floating animation
     robotController = AnimationController(
@@ -381,6 +484,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
       );
       isThinking = true;
     });
+    _persistLocalHistory();
 
     messageController.clear();
     scrollToBottom();
@@ -396,6 +500,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
         Uri.parse(chatUrl),
         headers: {
           "Content-Type": "application/json",
+          if (token.isNotEmpty) "Authorization": "Bearer $token",
         },
         body: jsonEncode({
           "message": text,
@@ -421,6 +526,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
           );
           isThinking = false;
         });
+        _persistLocalHistory();
 
         scrollToBottom();
 
@@ -448,7 +554,18 @@ class _ElderCareHomeState extends State<ElderCareHome>
 
     if (cleanText.isEmpty) return;
 
-    await stopSpeaking();
+    final thisToken = ++_speechToken;
+
+    // Safely stop any previous playback
+    try {
+      await audioPlayer.stop();
+    } catch (_) {}
+    try {
+      await flutterTts.stop();
+    } catch (_) {}
+
+    // If another speech action started while stopping, bail out cleanly
+    if (_speechToken != thisToken) return;
 
     bool streamStarted = false;
 
@@ -468,15 +585,30 @@ class _ElderCareHomeState extends State<ElderCareHome>
         streamUrl = '$baseUrl/api/tts?text=${Uri.encodeComponent(cleanText)}';
       }
 
+      if (_speechToken != thisToken) return;
       await audioPlayer.play(UrlSource(streamUrl));
-      streamStarted = true;
+      if (_speechToken == thisToken) {
+        streamStarted = true;
+      }
     } catch (e) {
+      final errString = e.toString().toLowerCase();
+      // In Chrome/HTML5, calling stop() or page reloading rejects play() with AbortError.
+      // This is an intentional cancellation, NOT a network/TTS failure that needs fallback.
+      final isAbort = errString.contains('abort') ||
+          errString.contains('interrupted') ||
+          errString.contains('pause');
+
+      if (isAbort || _speechToken != thisToken) {
+        debugPrint("Speech playback safely interrupted or cancelled: $e");
+        return;
+      }
+
       debugPrint("AudioPlayer stream playback error: $e. Falling back to flutter_tts.");
       streamStarted = false;
     }
 
-    // 2. Immediate fallback to local flutter_tts if stream failed to start
-    if (!streamStarted) {
+    // 2. Immediate fallback to local flutter_tts ONLY if stream truly failed and wasn't cancelled
+    if (!streamStarted && _speechToken == thisToken) {
       try {
         await flutterTts.speak(cleanText);
       } catch (e) {
@@ -495,6 +627,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
   // ==========================================================
 
   Future<void> stopSpeaking() async {
+    _speechToken++; // Invalidate any pending or resolving play calls
     try {
       await audioPlayer.stop();
     } catch (_) {}
@@ -684,6 +817,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
 
   @override
   void dispose() {
+    _speechToken++;
     robotController.dispose();
     speakingWaveController.dispose();
     messageController.dispose();
@@ -692,6 +826,53 @@ class _ElderCareHomeState extends State<ElderCareHome>
     flutterTts.stop();
     speechToText.stop();
     super.dispose();
+  }
+
+  // ==========================================================
+  // LOGOUT HANDLER
+  // ==========================================================
+
+  void _confirmAndLogout() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF142427),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+        ),
+        title: const Text(
+          "ലോഗ് ഔട്ട് ചെയ്യണോ?\nLog Out?",
+          style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold),
+        ),
+        content: const Text(
+          "അക്കൗണ്ടിൽ നിന്ന് പുറത്ത് കടക്കാൻ ആഗ്രഹിക്കുന്നുണ്ടോ?\nAre you sure you want to log out?",
+          style: TextStyle(color: Color(0xFFB0BEC5), fontSize: 16),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text("അല്ല (Cancel)", style: TextStyle(color: Colors.white70, fontSize: 16)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFD32F2F),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+            ),
+            onPressed: () async {
+              Navigator.of(ctx).pop();
+              try {
+                if (isSpeaking) await stopSpeaking();
+                if (isListening) await speechToText.stop();
+              } catch (_) {}
+              widget.onLogout();
+            },
+            child: const Text("ലോഗ് ഔട്ട് (Log Out)", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
   }
 
   // ==========================================================
@@ -704,6 +885,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
 
     return Scaffold(
       backgroundColor: const Color(0xFFF4F8F6),
+      resizeToAvoidBottomInset: false,
       body: SafeArea(
         child: Column(
           children: [
@@ -720,20 +902,23 @@ class _ElderCareHomeState extends State<ElderCareHome>
                 children: [
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    children: const [
+                    children: [
                       Text(
-                        "ElderCare",
-                        style: TextStyle(
-                          fontSize: 26,
+                        elderName,
+                        style: const TextStyle(
+                          fontSize: 24,
                           fontWeight: FontWeight.bold,
                           color: Color(0xFF315D54),
                         ),
                       ),
-                      SizedBox(height: 3),
+                      const SizedBox(height: 3),
                       Text(
-                        "നിങ്ങളുടെ കൂട്ടുകാരൻ",
-                        style: TextStyle(
-                          fontSize: 15,
+                        widget.session['caregiver_linking_code'] != null &&
+                                widget.session['caregiver_linking_code']!.isNotEmpty
+                            ? "കെയർ കോഡ്: ${widget.session['caregiver_linking_code']}"
+                            : "നിങ്ങളുടെ കൂട്ടുകാരൻ",
+                        style: const TextStyle(
+                          fontSize: 14,
                           color: Color(0xFF71847E),
                           fontWeight: FontWeight.w500,
                         ),
@@ -741,7 +926,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
                     ],
                   ),
 
-                  // Status Indicator / Audio control
+                  // Status Indicator / Audio control / Logout
                   Row(
                     children: [
                       if (isSpeaking)
@@ -772,23 +957,42 @@ class _ElderCareHomeState extends State<ElderCareHome>
                           onPressed: _showConversationSheet,
                         ),
                       ),
+                      // Prominent Elderly-Friendly Logout Action Button
                       Container(
-                        padding: const EdgeInsets.all(11),
+                        margin: const EdgeInsets.only(left: 6),
                         decoration: BoxDecoration(
-                          color: Colors.white,
-                          shape: BoxShape.circle,
+                          color: const Color(0xFFFDE8E8),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: const Color(0xFFFFCDD2)),
                           boxShadow: [
                             BoxShadow(
                               color: Colors.black.withValues(alpha: 0.05),
-                              blurRadius: 10,
-                              offset: const Offset(0, 4),
+                              blurRadius: 6,
+                              offset: const Offset(0, 2),
                             ),
                           ],
                         ),
-                        child: const Icon(
-                          Icons.favorite,
-                          color: Color(0xFF72B8A7),
-                          size: 24,
+                        child: InkWell(
+                          onTap: _confirmAndLogout,
+                          borderRadius: BorderRadius.circular(16),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.logout_rounded, color: Color(0xFFD32F2F), size: 20),
+                                SizedBox(width: 4),
+                                Text(
+                                  "ലോഗ് ഔട്ട്",
+                                  style: TextStyle(
+                                    color: Color(0xFFD32F2F),
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
                       ),
                     ],
@@ -803,19 +1007,22 @@ class _ElderCareHomeState extends State<ElderCareHome>
             Expanded(
               flex: 5,
               child: Center(
-                child: RobotWidget(
-                  robotAnimation: robotController,
-                  speakingAnimation: speakingWaveController,
-                  isSpeaking: isSpeaking,
-                  isThinking: isThinking,
-                  isListening: isListening,
-                  onTap: () {
-                    if (isSpeaking) {
-                      stopSpeaking();
-                    } else if (!isThinking) {
-                      toggleListening();
-                    }
-                  },
+                child: FittedBox(
+                  fit: BoxFit.contain,
+                  child: RobotWidget(
+                    robotAnimation: robotController,
+                    speakingAnimation: speakingWaveController,
+                    isSpeaking: isSpeaking,
+                    isThinking: isThinking,
+                    isListening: isListening,
+                    onTap: () {
+                      if (isSpeaking) {
+                        stopSpeaking();
+                      } else if (!isThinking) {
+                        toggleListening();
+                      }
+                    },
+                  ),
                 ),
               ),
             ),

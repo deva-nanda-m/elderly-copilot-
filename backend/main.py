@@ -25,6 +25,8 @@ try:
         get_sentiment_analyzer,
         save_sentiment_record,
     )
+    from auth import auth_router
+    from database import get_central_db, ChatMessageRecord, MessageRole
 except ImportError:
     from backend.sentiment import (
         sentiment_router,
@@ -32,6 +34,8 @@ except ImportError:
         get_sentiment_analyzer,
         save_sentiment_record,
     )
+    from backend.auth import auth_router
+    from backend.database import get_central_db, ChatMessageRecord, MessageRole
 
 # ---------------------------------------------------------
 # LOAD ENVIRONMENT VARIABLES
@@ -88,6 +92,10 @@ app.add_middleware(
 init_sentiment_db()
 get_sentiment_analyzer(client)
 app.include_router(sentiment_router)
+
+# Initialize central DB & mount authentication router
+get_central_db()
+app.include_router(auth_router)
 
 
 # ---------------------------------------------------------
@@ -335,6 +343,33 @@ async def _analyze_utterance_in_background(text: str, elder_id: str, session_id:
         print(f"Background sentiment analysis error: {err}")
 
 
+def _record_messages_to_central_db(elder_id: str, session_id: str, user_text: str, assistant_text: str, audio_url: str):
+    try:
+        db = get_central_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        u_msg = ChatMessageRecord(
+            id=f"msg_{int(datetime.now(timezone.utc).timestamp()*1000)}_u",
+            elder_id=elder_id,
+            session_id=session_id,
+            role=MessageRole.USER,
+            text=user_text,
+            timestamp=now_iso,
+        )
+        db.save_chat_message(u_msg)
+        a_msg = ChatMessageRecord(
+            id=f"msg_{int(datetime.now(timezone.utc).timestamp()*1000)}_a",
+            elder_id=elder_id,
+            session_id=session_id,
+            role=MessageRole.ASSISTANT,
+            text=assistant_text,
+            audio_url=audio_url,
+            timestamp=now_iso,
+        )
+        db.save_chat_message(a_msg)
+    except Exception as e:
+        print(f"Background central DB message record error: {e}")
+
+
 @app.post(
     "/chat",
     response_model=ChatResponse
@@ -402,6 +437,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             tts_text_cache.pop(next(iter(tts_text_cache)), None)
 
         audio_url = f"/api/tts/stream/{audio_id}"
+
+        # Persist conversation to central database asynchronously
+        background_tasks.add_task(
+            _record_messages_to_central_db,
+            elder_id,
+            session_id,
+            request.message.strip(),
+            reply_text,
+            audio_url,
+        )
 
         return ChatResponse(
             response=reply_text,
