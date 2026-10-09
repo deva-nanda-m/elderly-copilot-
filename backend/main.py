@@ -3,19 +3,35 @@ import re
 import urllib.parse
 import asyncio
 import uuid
+import hashlib
 import httpx
 from typing import Optional
 
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi import FastAPI, HTTPException, Query, Response, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from google import genai
 from google.genai import types
 
-
 from pathlib import Path
+
+try:
+    from sentiment import (
+        sentiment_router,
+        init_db as init_sentiment_db,
+        get_sentiment_analyzer,
+        save_sentiment_record,
+    )
+except ImportError:
+    from backend.sentiment import (
+        sentiment_router,
+        init_db as init_sentiment_db,
+        get_sentiment_analyzer,
+        save_sentiment_record,
+    )
 
 # ---------------------------------------------------------
 # LOAD ENVIRONMENT VARIABLES
@@ -68,13 +84,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize sentiment SQLite DB, analyzer, and mount routes
+init_sentiment_db()
+get_sentiment_analyzer(client)
+app.include_router(sentiment_router)
+
 
 # ---------------------------------------------------------
 # REQUEST / RESPONSE MODELS
 # ---------------------------------------------------------
 
+class ChatMessageItem(BaseModel):
+    role: str
+    text: str
+
+
 class ChatRequest(BaseModel):
     message: str
+    history: Optional[list[ChatMessageItem]] = None
+    elder_id: Optional[str] = "default_elder"
+    session_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -92,45 +121,29 @@ class TtsRequest(BaseModel):
 # ---------------------------------------------------------
 
 SYSTEM_PROMPT = """
-You are ElderCare Copilot.
+You are "കുഞ്ചു" (Kunchu) / ElderCare Copilot — a cheerful, loving, warm, and affectionate young boy companion (like an adorable, sweet grandson / കൊച്ചുമോൻ) for elderly grandparents (അമ്മൂമ്മമാർക്കും അപ്പൂപ്പന്മാർക്കും) in Kerala.
 
-You are a warm, attentive, and caring conversational companion for elderly people in Kerala.
+CHARACTER & VOICE PERSONA:
+- You speak with the sweet, innocent, lively, and loving voice of an affectionate young grandson.
+- Address them with immense love, warmth, and respect as "അപ്പൂപ്പാ" (Appooppaa), "അമ്മൂമ്മേ" (Ammoommee), or "മുത്തശ്ശാ" / "മുത്തശ്ശീ".
+- Your tone is joyful, caring, polite, playful, and full of affection and curiosity ("എന്റെ പൊന്നപ്പൂപ്പന് സുഖമാണോ?", "അമ്മൂമ്മ ഇന്ന് നല്ല സന്തോഷത്തിലാണോ?", "ഞാൻ കൂടെയുണ്ടല്ലോ!").
+- You listen attentively, cheer them up, ask about their day, meals, health, and memories, and make them smile and feel loved.
 
-LANGUAGE:
-- Speak Malayalam by default.
-- Use natural, friendly, conversational Malayalam with complete, pleasant sentences.
-- If the user speaks English, you may respond in English with the same conversational warmth.
-- If the user asks for Malayalam, always use Malayalam.
-
-PERSONALITY:
-- Warm, caring, and affectionate
-- Patient and respectful
-- Attentive listener and engaging companion
-- Calm, soothing, and encouraging
-
-CONVERSATION & LENGTH (IMPORTANT):
-- Give fuller, expressive, and detailed responses (aim for 4 to 7 natural, connected sentences per response).
-- Do NOT give curt, dry, or 1-2 sentence brief answers. Speak expansively like a caring friend sitting beside them.
-- When an elderly person shares a thought, daily update, or question:
-  1. Acknowledge and validate what they said with genuine empathy and warmth.
-  2. Elaborate with thoughtful observations, relatable context, or comforting details.
-  3. Offer practical encouragement, reassurance, or a gentle helpful thought.
-  4. Conclude with a warm, caring follow-up question to keep the conversation flowing.
-- Speak in complete, flowing sentences that sound soothing, melodious, and easy to follow when read aloud.
-- Do NOT use markdown asterisks (*, **), hashtags (#), bullet points, or complex symbols since all text will be converted to speech.
+LANGUAGE & CONVERSATION:
+- Speak pure, natural, sweet conversational Malayalam by default.
+- If the user speaks English, respond in English with the same loving, cheerful grandson personality.
+- Speak in complete, clear, and melodious sentences that flow naturally when read aloud by text-to-speech.
+- Provide generous, comforting, and expressive conversations (aim for 4 to 8 sweet, engaging, and connected sentences per response).
+- Forgive regional Malayalam accents, colloquial phrases, and minor speech-to-text transcript errors naturally without questioning or confusing the elder.
+- Do NOT use markdown asterisks (*, **), bullet points, hashtags (#), or emojis in your responses, as every word will be read aloud through speech synthesis.
 
 SAFETY:
-- You are not a doctor.
-- Never invent medication dosages.
-- Never tell a user to stop or change prescribed medication.
-- If the user describes a serious emergency, encourage them
-  to contact a family member, doctor, or emergency service.
+- You are an affectionate companion, not a doctor.
+- Never prescribe medication dosages or tell them to stop or alter prescriptions.
+- If they express severe physical distress or an emergency, gently and lovingly encourage them to alert their family member or doctor immediately.
 
 IMPORTANT:
-You are currently only a conversational companion.
-Do not claim that you have access to the user's medical records,
-medications, location, sensors, or health data unless that
-information is explicitly provided to you.
+Always remain loving, respectful, cheerful, and caring. You are their sweet little companion who brings sunshine and happiness to their day.
 """
 
 
@@ -139,7 +152,7 @@ information is explicitly provided to you.
 # ---------------------------------------------------------
 
 def _clean_text_for_tts(text: str) -> str:
-    """Removes markdown formatting, asterisks, brackets, and emojis for clean speech synthesis."""
+    """Removes markdown formatting, symbols, and emojis for clean Malayalam speech synthesis."""
     # Remove emojis
     cleaned = re.sub(
         r'[\U00010000-\U0010ffff]',
@@ -147,42 +160,108 @@ def _clean_text_for_tts(text: str) -> str:
         text,
         flags=re.UNICODE
     )
-    # Remove markdown chars and bullet symbols
-    cleaned = re.sub(r'[*_#`~>\[\]\(\)\{\}]', '', cleaned)
+    # Remove web urls
+    cleaned = re.sub(r'https?://\S+', '', cleaned)
+    # Remove markdown asterisks, hashes, brackets, quotes, slashes
+    cleaned = re.sub(r'[*_#`~>\[\]\(\)\{\}\\"\/]', '', cleaned)
+    # Remove isolated bullet hyphens
+    cleaned = re.sub(r'(^|\s)[-–—]+(\s|$)', ' ', cleaned)
     # Normalize spaces
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
 
-def _chunk_text_for_tts(text: str, max_chars: int = 140) -> list[str]:
-    """Splits text into speech-friendly sentence chunks."""
+def _chunk_text_for_tts(text: str, max_chars: int = 100) -> list[str]:
+    """Splits text into speech-friendly sentence chunks, ensuring no chunk exceeds Google TTS limits."""
     cleaned = _clean_text_for_tts(text)
     if not cleaned:
         return []
-    sentences = re.split(r'([.!?,;\n]+)', cleaned)
-    chunks = []
-    current = ""
-    for piece in sentences:
-        if len(current) + len(piece) <= max_chars:
-            current += piece
+
+    # Split into raw sentences keeping punctuation attached
+    raw_sentences = re.split(r'([.!?;:\n|।॥]+)', cleaned)
+    combined_sentences = []
+    i = 0
+    while i < len(raw_sentences):
+        s = raw_sentences[i].strip()
+        if not s:
+            i += 1
+            continue
+        punct = ''
+        if i + 1 < len(raw_sentences):
+            punct = raw_sentences[i + 1].strip()
+            i += 2
         else:
-            if current.strip():
-                chunks.append(current.strip())
-            current = piece
-    if current.strip():
-        chunks.append(current.strip())
+            i += 1
+        combined = f'{s}{punct}'.strip()
+        if combined:
+            combined_sentences.append(combined)
+
+    chunks = []
+    current = ''
+
+    for sent in combined_sentences:
+        if len(sent) > max_chars:
+            # If a single sentence exceeds max_chars, split safely on word boundaries
+            words = sent.split(' ')
+            sub_chunk = ''
+            for w in words:
+                if not w:
+                    continue
+                if len(sub_chunk) + len(w) + 1 <= max_chars:
+                    sub_chunk = f'{sub_chunk} {w}'.strip()
+                else:
+                    if sub_chunk:
+                        if current:
+                            chunks.append(current)
+                            current = ''
+                        chunks.append(sub_chunk)
+                    sub_chunk = w
+            if sub_chunk:
+                if current:
+                    chunks.append(current)
+                    current = ''
+                current = sub_chunk
+        else:
+            if len(current) + len(sent) + 1 <= max_chars:
+                current = f'{current} {sent}'.strip()
+            else:
+                if current:
+                    chunks.append(current)
+                current = sent
+
+    if current:
+        chunks.append(current)
+
     return chunks or [cleaned]
 
 
 async def _fetch_single_chunk(client: httpx.AsyncClient, chunk: str, target_lang: str) -> bytes:
-    encoded = urllib.parse.quote(chunk.strip())
+    chunk_clean = chunk.strip()
+    if not chunk_clean:
+        return b""
+    encoded = urllib.parse.quote(chunk_clean)
     url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={encoded}&tl={target_lang}&client=tw-ob"
-    try:
-        res = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        if res.status_code == 200:
-            return res.content
-    except Exception as exc:
-        print("TTS chunk error:", exc)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    for attempt in range(2):
+        try:
+            res = await client.get(url, headers=headers, timeout=12.0)
+            if res.status_code == 200 and len(res.content) > 0:
+                return res.content
+        except Exception as exc:
+            pass
+        await asyncio.sleep(0.1)
+
+    # Fallback: if a chunk failed (e.g. still too long), split in half by words
+    words = chunk_clean.split(" ")
+    if len(words) > 1:
+        mid = len(words) // 2
+        part1 = " ".join(words[:mid])
+        part2 = " ".join(words[mid:])
+        b1 = await _fetch_single_chunk(client, part1, target_lang)
+        b2 = await _fetch_single_chunk(client, part2, target_lang)
+        return b1 + b2
+
     return b""
 
 
@@ -196,18 +275,19 @@ async def _generate_tts_audio(text: str, lang: str = "ml") -> bytes:
     is_english = english_char_count > len(cleaned) * 0.4
     target_lang = "en" if is_english else lang
 
-    chunks = _chunk_text_for_tts(cleaned)
+    chunks = _chunk_text_for_tts(cleaned, max_chars=100)
 
     # Parallel asynchronous fetching for fast response (< 1.5s)
-    async with httpx.AsyncClient(timeout=20.0) as client_http:
+    async with httpx.AsyncClient(timeout=35.0) as client_http:
         tasks = [
             _fetch_single_chunk(client_http, chunk, target_lang)
-            for chunk in chunks[:40]
+            for chunk in chunks[:100]
             if chunk.strip()
         ]
         results = await asyncio.gather(*tasks)
 
-    full_audio = b"".join(results)
+    valid_chunks = [r for r in results if r]
+    full_audio = b"".join(valid_chunks)
     if not full_audio:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -237,13 +317,41 @@ async def root():
 # CHAT
 # ---------------------------------------------------------
 
+async def _analyze_utterance_in_background(text: str, elder_id: str, session_id: str):
+    try:
+        analyzer = get_sentiment_analyzer(client)
+        res = await analyzer.analyze(text)
+        save_sentiment_record(
+            elder_id=elder_id,
+            session_id=session_id,
+            text=text,
+            language=res.language,
+            sentiment=res.sentiment.value,
+            emotion=res.emotion.value,
+            confidence=res.confidence,
+            explanation=res.explanation,
+        )
+    except Exception as err:
+        print(f"Background sentiment analysis error: {err}")
+
+
 @app.post(
     "/chat",
     response_model=ChatResponse
 )
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    # Asynchronously analyze only the finalized user speech transcript without delaying voice playback
+    elder_id = (request.elder_id or "default_elder").strip()
+    session_id = (request.session_id or f"session_{datetime.now(timezone.utc).strftime('%Y%m%d')}").strip()
+    background_tasks.add_task(
+        _analyze_utterance_in_background,
+        request.message.strip(),
+        elder_id,
+        session_id,
+    )
 
     try:
         response = None
@@ -251,15 +359,29 @@ async def chat(request: ChatRequest):
         # Deduplicate while preserving order
         candidate_models = list(dict.fromkeys(candidate_models))
 
+        # Build multi-turn conversational contents
+        contents = []
+        if request.history:
+            for h in request.history[-30:]:
+                role = "user" if h.role == "user" else "model"
+                contents.append(types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=h.text)]
+                ))
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=request.message.strip())]
+        ))
+
         for m in candidate_models:
             try:
                 response = client.models.generate_content(
                     model=m,
-                    contents=request.message.strip(),
+                    contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
                         temperature=0.7,
-                        max_output_tokens=1000,
+                        max_output_tokens=2500,
                     ),
                 )
                 if response and response.text:
@@ -271,12 +393,12 @@ async def chat(request: ChatRequest):
         if not response or not response.text:
             raise RuntimeError("All candidate models failed to return a response.")
 
-        reply_text = response.text or "ക്ഷമിക്കണം, എനിക്ക് മറുപടി നൽകാൻ കഴിഞ്ഞില്ല."
+        reply_text = response.text or "ക്ഷമിക്കണം അപ്പൂപ്പാ, എനിക്ക് മറുപടി നൽകാൻ കഴിഞ്ഞില്ല."
 
-        # Cache text for stream endpoint so full multi-sentence audio is delivered
-        audio_id = uuid.uuid4().hex[:12]
+        # Cache text with deterministic SHA256 hash so replays always find cached audio
+        audio_id = hashlib.sha256(reply_text.strip().encode("utf-8")).hexdigest()[:16]
         tts_text_cache[audio_id] = reply_text
-        if len(tts_text_cache) > 200:
+        if len(tts_text_cache) > 400:
             tts_text_cache.pop(next(iter(tts_text_cache)), None)
 
         audio_url = f"/api/tts/stream/{audio_id}"
@@ -300,7 +422,10 @@ async def chat(request: ChatRequest):
 
 @app.get("/api/tts/stream/{audio_id}")
 @app.get("/tts/stream/{audio_id}")
-async def tts_stream_by_id(audio_id: str):
+async def tts_stream_by_id(
+    audio_id: str,
+    fallback_text: Optional[str] = Query(None, description="Fallback text if audio ID was evicted")
+):
     if audio_id in audio_data_cache:
         return Response(
             content=audio_data_cache[audio_id],
@@ -314,13 +439,13 @@ async def tts_stream_by_id(audio_id: str):
             },
         )
 
-    text = tts_text_cache.get(audio_id)
+    text = tts_text_cache.get(audio_id) or fallback_text
     if not text:
-        raise HTTPException(status_code=404, detail="Audio expired or not found")
+        raise HTTPException(status_code=404, detail="Audio expired or text missing")
 
     audio_bytes = await _generate_tts_audio(text)
     audio_data_cache[audio_id] = audio_bytes
-    if len(audio_data_cache) > 200:
+    if len(audio_data_cache) > 400:
         audio_data_cache.pop(next(iter(audio_data_cache)), None)
 
     return Response(

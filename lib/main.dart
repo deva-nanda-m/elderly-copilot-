@@ -103,15 +103,19 @@ class _ElderCareHomeState extends State<ElderCareHome>
   bool isThinking = false;
   bool isSpeaking = false;
   bool isListening = false;
+  bool isSubmittingVoice = false;
   bool speechEnabled = false;
   String speechLocaleId = 'ml_IN';
 
   // ----------------------------------------------------------
-  // FASTAPI BACKEND URLS
+  // FASTAPI BACKEND URLS & SESSION
   // ----------------------------------------------------------
 
   static const String baseUrl = "http://127.0.0.1:8000";
   static const String chatUrl = "$baseUrl/chat";
+
+  final String elderId = "elder_001";
+  late final String sessionId;
 
   // ==========================================================
   // INIT
@@ -120,6 +124,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
   @override
   void initState() {
     super.initState();
+    sessionId = "session_${DateTime.now().millisecondsSinceEpoch}";
 
     // Robot breathing and floating animation
     robotController = AnimationController(
@@ -127,11 +132,11 @@ class _ElderCareHomeState extends State<ElderCareHome>
       duration: const Duration(milliseconds: 1800),
     )..repeat(reverse: true);
 
-    // Fast speaking visualizer pulse animation
+    // Speaking visualizer animation - only runs when sound is actively playing
     speakingWaveController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 800),
-    )..repeat();
+    );
 
     setupAudioAndTTS();
     initSpeech();
@@ -142,48 +147,78 @@ class _ElderCareHomeState extends State<ElderCareHome>
   // ==========================================================
 
   Future<void> setupAudioAndTTS() async {
-    // 1. AudioPlayer listeners for backend TTS streaming
+    // 1. AudioPlayer listeners for backend TTS streaming with animation sync
     audioPlayer.onPlayerStateChanged.listen((state) {
       if (!mounted) return;
       if (state == PlayerState.playing) {
-        if (!isSpeaking) setState(() => isSpeaking = true);
+        if (!isSpeaking) {
+          setState(() => isSpeaking = true);
+        }
+        if (!speakingWaveController.isAnimating) {
+          speakingWaveController.repeat();
+        }
       } else if (state == PlayerState.completed ||
-          state == PlayerState.stopped) {
-        if (isSpeaking) setState(() => isSpeaking = false);
+          state == PlayerState.stopped ||
+          state == PlayerState.paused) {
+        if (isSpeaking) {
+          setState(() => isSpeaking = false);
+        }
+        if (speakingWaveController.isAnimating) {
+          speakingWaveController.stop();
+          speakingWaveController.reset();
+        }
       }
     });
 
     audioPlayer.onPlayerComplete.listen((_) {
       if (!mounted) return;
-      setState(() => isSpeaking = false);
+      if (isSpeaking) {
+        setState(() => isSpeaking = false);
+      }
+      speakingWaveController.stop();
+      speakingWaveController.reset();
     });
 
-    // 2. Offline FlutterTts fallback setup
+    // Slight speedup for lively, friendly rhythm
+    try {
+      await audioPlayer.setPlaybackRate(1.04);
+    } catch (_) {}
+
+    // 2. Offline FlutterTts fallback setup - youthful little-boy pitch & pace
     try {
       await flutterTts.setLanguage("ml-IN");
-      await flutterTts.setSpeechRate(0.42);
+      await flutterTts.setSpeechRate(0.48); // Natural, lively pace
+      await flutterTts.setPitch(1.30); // Sweet, higher youthful little-boy tone
       await flutterTts.setVolume(1.0);
-      await flutterTts.setPitch(1.0);
 
       flutterTts.setStartHandler(() {
         if (!mounted) return;
         setState(() => isSpeaking = true);
+        if (!speakingWaveController.isAnimating) {
+          speakingWaveController.repeat();
+        }
       });
 
       flutterTts.setCompletionHandler(() {
         if (!mounted) return;
         setState(() => isSpeaking = false);
+        speakingWaveController.stop();
+        speakingWaveController.reset();
       });
 
       flutterTts.setCancelHandler(() {
         if (!mounted) return;
         setState(() => isSpeaking = false);
+        speakingWaveController.stop();
+        speakingWaveController.reset();
       });
 
       flutterTts.setErrorHandler((msg) {
         debugPrint("TTS fallback error: $msg");
         if (!mounted) return;
         setState(() => isSpeaking = false);
+        speakingWaveController.stop();
+        speakingWaveController.reset();
       });
     } catch (e) {
       debugPrint("TTS setup exception: $e");
@@ -208,9 +243,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
           if (status == 'done' || status == 'notListening') {
             if (mounted && isListening) {
               setState(() => isListening = false);
-              if (messageController.text.trim().isNotEmpty) {
-                sendMessage();
-              }
+              _finishVoiceInputAndSend();
             }
           }
         },
@@ -221,7 +254,9 @@ class _ElderCareHomeState extends State<ElderCareHome>
         String selected = 'ml_IN';
         if (locales.isNotEmpty) {
           final ml = locales
-              .where((l) => l.localeId.toLowerCase().startsWith('ml'))
+              .where((l) =>
+                  l.localeId.toLowerCase().startsWith('ml') ||
+                  l.name.toLowerCase().contains('malayalam'))
               .firstOrNull;
           final en = locales
               .where((l) => l.localeId.toLowerCase().startsWith('en'))
@@ -246,6 +281,18 @@ class _ElderCareHomeState extends State<ElderCareHome>
     }
   }
 
+  // Safe submission of voice input that prevents duplicate sends
+  void _finishVoiceInputAndSend() {
+    if (isSubmittingVoice) return;
+    final text = messageController.text.trim();
+    if (text.isNotEmpty && !isThinking) {
+      isSubmittingVoice = true;
+      sendMessage().whenComplete(() {
+        isSubmittingVoice = false;
+      });
+    }
+  }
+
   // ==========================================================
   // TOGGLE VOICE INPUT (MICROPHONE)
   // ==========================================================
@@ -254,9 +301,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
     if (isListening) {
       await speechToText.stop();
       setState(() => isListening = false);
-      if (messageController.text.trim().isNotEmpty) {
-        sendMessage();
-      }
+      _finishVoiceInputAndSend();
     } else {
       if (isSpeaking) {
         await stopSpeaking();
@@ -278,15 +323,19 @@ class _ElderCareHomeState extends State<ElderCareHome>
             setState(() {
               messageController.text = result.recognizedWords;
             });
+            // If final result is reached and valid, submit safely
             if (result.finalResult &&
                 result.recognizedWords.trim().isNotEmpty) {
               speechToText.stop();
               setState(() => isListening = false);
-              sendMessage();
+              _finishVoiceInputAndSend();
             }
           },
           listenOptions: stt.SpeechListenOptions(
-            listenMode: stt.ListenMode.confirmation,
+            listenMode: stt.ListenMode.dictation,
+            pauseFor: const Duration(seconds: 3), // Accommodate elder pauses
+            listenFor: const Duration(seconds: 45), // Generous speech window
+            partialResults: true,
             localeId: speechLocaleId,
           ),
         );
@@ -337,6 +386,12 @@ class _ElderCareHomeState extends State<ElderCareHome>
     scrollToBottom();
 
     try {
+      // Include past conversation history for continuous multi-turn dialogue
+      final historyList = messages.take(messages.length - 1).map((m) => {
+        "role": m.isUser ? "user" : "model",
+        "text": m.text,
+      }).toList();
+
       final response = await http.post(
         Uri.parse(chatUrl),
         headers: {
@@ -344,13 +399,16 @@ class _ElderCareHomeState extends State<ElderCareHome>
         },
         body: jsonEncode({
           "message": text,
+          "history": historyList,
+          "elder_id": elderId,
+          "session_id": sessionId,
         }),
       );
 
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final String reply = data["response"] ??
-            "ക്ഷമിക്കണം, എനിക്ക് മറുപടി നൽകാൻ കഴിഞ്ഞില്ല.";
+            "ക്ഷമിക്കണം അപ്പൂപ്പാ, എനിക്ക് മറുപടി നൽകാൻ കഴിഞ്ഞില്ല.";
         final String? audioUrl = data["audio_url"];
 
         setState(() {
@@ -366,7 +424,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
 
         scrollToBottom();
 
-        // Speak the response using the fixed TTS engine
+        // Speak the response using the synchronized TTS engine
         await playSpeech(reply, audioUrl: audioUrl);
       } else {
         debugPrint("Server error: ${response.statusCode}");
@@ -379,12 +437,12 @@ class _ElderCareHomeState extends State<ElderCareHome>
   }
 
   // ==========================================================
-  // PLAY SPEECH (FIXED TTS ENGINE)
+  // PLAY SPEECH (FIXED TTS ENGINE WITH RELIABLE FALLBACK)
   // ==========================================================
 
   Future<void> playSpeech(String text, {String? audioUrl}) async {
     final cleanText = text
-        .replaceAll(RegExp(r'[*_#`~>\[\]]'), '')
+        .replaceAll(RegExp(r'[*_#`~>\[\]\(\)\{\}\\"\/]'), '')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
 
@@ -392,10 +450,7 @@ class _ElderCareHomeState extends State<ElderCareHome>
 
     await stopSpeaking();
 
-    if (!mounted) return;
-    setState(() {
-      isSpeaking = true;
-    });
+    bool streamStarted = false;
 
     // 1. Try high-fidelity streaming audio from FastAPI
     try {
@@ -404,22 +459,34 @@ class _ElderCareHomeState extends State<ElderCareHome>
         streamUrl = audioUrl.startsWith('http')
             ? audioUrl
             : '$baseUrl$audioUrl';
+        // Add fallback_text query param so backend never returns 404 even if cache expired
+        if (!streamUrl.contains('fallback_text=')) {
+          final separator = streamUrl.contains('?') ? '&' : '?';
+          streamUrl = '$streamUrl${separator}fallback_text=${Uri.encodeComponent(cleanText)}';
+        }
       } else {
         streamUrl = '$baseUrl/api/tts?text=${Uri.encodeComponent(cleanText)}';
       }
 
       await audioPlayer.play(UrlSource(streamUrl));
-      return;
+      streamStarted = true;
     } catch (e) {
       debugPrint("AudioPlayer stream playback error: $e. Falling back to flutter_tts.");
+      streamStarted = false;
     }
 
-    // 2. Fallback to local flutter_tts
-    try {
-      await flutterTts.speak(cleanText);
-    } catch (e) {
-      debugPrint("TTS fallback failed: $e");
-      if (mounted) setState(() => isSpeaking = false);
+    // 2. Immediate fallback to local flutter_tts if stream failed to start
+    if (!streamStarted) {
+      try {
+        await flutterTts.speak(cleanText);
+      } catch (e) {
+        debugPrint("TTS fallback failed: $e");
+        if (mounted && isSpeaking) {
+          setState(() => isSpeaking = false);
+          speakingWaveController.stop();
+          speakingWaveController.reset();
+        }
+      }
     }
   }
 
@@ -439,7 +506,143 @@ class _ElderCareHomeState extends State<ElderCareHome>
       setState(() {
         isSpeaking = false;
       });
+      speakingWaveController.stop();
+      speakingWaveController.reset();
     }
+  }
+
+  // ==========================================================
+  // CONVERSATION HISTORY SHEET & REPLAY
+  // ==========================================================
+
+  void _showConversationSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Container(
+          height: MediaQuery.of(context).size.height * 0.72,
+          decoration: const BoxDecoration(
+            color: Color(0xFFF4F8F6),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          ),
+          child: Column(
+            children: [
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 12),
+                width: 44,
+                height: 5,
+                decoration: BoxDecoration(
+                  color: Colors.black26,
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 6),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      "സംഭാഷണങ്ങൾ",
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF315D54),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Color(0xFF315D54)),
+                      onPressed: () => Navigator.of(ctx).pop(),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: messages.isEmpty
+                    ? const Center(
+                        child: Text(
+                          "സംഭാഷണം തുടങ്ങിയിട്ടില്ല. താഴെ മൈക്കിൽ തൊട്ട് പറയൂ!",
+                          style: TextStyle(fontSize: 16, color: Colors.black45),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        itemCount: messages.length,
+                        itemBuilder: (context, index) {
+                          final msg = messages[index];
+                          return Align(
+                            alignment: msg.isUser
+                                ? Alignment.centerRight
+                                : Alignment.centerLeft,
+                            child: Container(
+                              margin: const EdgeInsets.symmetric(vertical: 6),
+                              padding: const EdgeInsets.all(14),
+                              constraints: BoxConstraints(
+                                maxWidth: MediaQuery.of(context).size.width * 0.82,
+                              ),
+                              decoration: BoxDecoration(
+                                color: msg.isUser
+                                    ? const Color(0xFFD3ECE5)
+                                    : Colors.white,
+                                borderRadius: BorderRadius.circular(16),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.04),
+                                    blurRadius: 6,
+                                    offset: const Offset(0, 2),
+                                  ),
+                                ],
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      msg.text,
+                                      style: TextStyle(
+                                        fontSize: 15,
+                                        height: 1.42,
+                                        color: msg.isUser
+                                            ? const Color(0xFF1E3833)
+                                            : const Color(0xFF2C3E3A),
+                                      ),
+                                    ),
+                                  ),
+                                  if (!msg.isUser) ...[
+                                    const SizedBox(width: 8),
+                                    GestureDetector(
+                                      onTap: () {
+                                        playSpeech(msg.text, audioUrl: msg.audioUrl);
+                                      },
+                                      child: Container(
+                                        padding: const EdgeInsets.all(6),
+                                        decoration: const BoxDecoration(
+                                          color: Color(0xFFE8F4F1),
+                                          shape: BoxShape.circle,
+                                        ),
+                                        child: const Icon(
+                                          Icons.volume_up,
+                                          size: 18,
+                                          color: Color(0xFF4D8F80),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   // ==========================================================
@@ -550,6 +753,25 @@ class _ElderCareHomeState extends State<ElderCareHome>
                             onPressed: stopSpeaking,
                           ),
                         ),
+                      Container(
+                        margin: const EdgeInsets.only(right: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.05),
+                              blurRadius: 10,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                        child: IconButton(
+                          icon: const Icon(Icons.chat_bubble_outline, color: Color(0xFF4D8F80)),
+                          tooltip: "സംഭാഷണങ്ങൾ",
+                          onPressed: _showConversationSheet,
+                        ),
+                      ),
                       Container(
                         padding: const EdgeInsets.all(11),
                         decoration: BoxDecoration(
