@@ -102,3 +102,51 @@ def get_current_elder_id(authorization: Optional[str] = Header(default=None)) ->
             detail="Token payload missing elder identifier.",
         )
     return str(elder_id)
+
+
+def create_caregiver_access_token(caregiver_id: str, email: str, full_name: str, role: str = "primary") -> str:
+    """Generates an authenticated JWT bearer token for caregivers valid for 30 days."""
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(days=JWT_EXPIRATION_DAYS)
+    payload = {
+        "sub": caregiver_id,
+        "email": email,
+        "name": full_name,
+        "role": role,
+        "user_type": "caregiver",
+        "iat": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+        "iss": "eldercare-copilot-caregiver-auth",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_caregiver_id(authorization: Optional[str] = Header(default=None)) -> str:
+    """FastAPI Dependency: extracts and verifies caregiver_id from Authorization: Bearer <token>."""
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header. Caregiver login required.",
+        )
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authorization header format. Expected 'Bearer <token>'.",
+        )
+    token = parts[1]
+    payload = decode_access_token(token)
+    user_type = payload.get("user_type")
+    if user_type != "caregiver":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Caregiver authorization required for this operation.",
+        )
+    caregiver_id = payload.get("sub")
+    if not caregiver_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token payload missing caregiver identifier.",
+        )
+    return str(caregiver_id)
+

@@ -1,43 +1,39 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-/*import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:elderly_conv_copilot/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  testWidgets('ElderCare Copilot loads AuthScreen on first launch', (WidgetTester tester) async {
+    await tester.pumpWidget(const ElderCareApp());
+    await tester.pumpAndSettle();
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+    // Verifies that unauthenticated launch brings up senior-friendly authentication
+    expect(find.byType(MaterialApp), findsOneWidget);
+    expect(find.textContaining('ലോഗിൻ'), findsWidgets);
+  });
+
+  testWidgets('ElderCareHome loads when session is present', (WidgetTester tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ElderCareHome(
+          session: const {
+            'token': 'mock_token',
+            'elder_id': 'elder_test',
+            'name': 'മാധവൻ നായർ',
+            'caregiver_linking_code': 'CARE-1234',
+          },
+          onLogout: () {},
+        ),
+      ),
+    );
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
-  });
-}
-*/
-import 'package:flutter_test/flutter_test.dart';
-import 'package:elderly_conv_copilot/main.dart';
-
-void main() {
-  testWidgets('ElderCare Copilot loads', (WidgetTester tester) async {
-    await tester.pumpWidget(const ElderCareApp());
-
-    expect(find.text('ElderCare'), findsOneWidget);
-    expect(find.text('നിങ്ങളുടെ കൂട്ടുകാരൻ'), findsOneWidget);
-    expect(find.text('എന്നോട് സംസാരിക്കൂ'), findsOneWidget);
+    expect(find.text('മാധവൻ നായർ'), findsOneWidget);
+    expect(find.textContaining('കെയർ കോഡ്: CARE-1234'), findsOneWidget);
   });
 }

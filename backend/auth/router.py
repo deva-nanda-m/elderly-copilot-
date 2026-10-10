@@ -10,7 +10,7 @@ Exposes endpoints for:
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status
-from typing import Optional
+from typing import Optional, List
 
 from database.schemas import (
     ElderSignupRequest,
@@ -20,6 +20,7 @@ from database.schemas import (
     ElderInDB,
     SyncBatchRequest,
     SyncBatchResponse,
+    ChatMessageRecord,
 )
 from database.mongodb import get_central_db
 from .security import (
@@ -214,3 +215,25 @@ async def sync_offline_operations(
     db = get_central_db()
     response = db.process_sync_batch(payload.elder_id, payload.operations)
     return response
+
+
+@router.get(
+    "/elders/{elder_id}/chat-history",
+    response_model=List[ChatMessageRecord],
+    summary="Get elder chat history",
+    description="Retrieves chat history for an elder with strict authorization check.",
+)
+async def get_elder_chat_history(
+    elder_id: str,
+    limit: int = 50,
+    current_elder_id: str = Depends(get_current_elder_id),
+):
+    if current_elder_id != elder_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: cannot view another elder's chat history.",
+        )
+
+    db = get_central_db()
+    return db.get_chat_history(elder_id=elder_id, limit=limit)
+

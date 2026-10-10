@@ -97,17 +97,28 @@ class _ElderCareAppState extends State<ElderCareApp> {
 // ============================================================
 
 class ChatMessage {
+  final String id;
+  final String elderId;
+  final String sessionId;
   final String text;
   final bool isUser;
   final String? audioUrl;
   final DateTime timestamp;
+  final String syncStatus; // 'synced', 'pending', 'failed'
 
   ChatMessage({
+    String? id,
+    String? elderId,
+    String? sessionId,
     required this.text,
     required this.isUser,
     this.audioUrl,
     DateTime? timestamp,
-  }) : timestamp = timestamp ?? DateTime.now();
+    this.syncStatus = 'synced',
+  })  : id = id ?? 'msg_${elderId ?? "elder"}_${DateTime.now().millisecondsSinceEpoch}_${isUser ? "u" : "a"}',
+        elderId = elderId ?? 'elder_default',
+        sessionId = sessionId ?? 'session_default',
+        timestamp = timestamp ?? DateTime.now();
 }
 
 // ============================================================
@@ -183,40 +194,109 @@ class _ElderCareHomeState extends State<ElderCareHome>
   String get token => widget.session['token'] ?? '';
   late final String sessionId;
 
+  // ----------------------------------------------------------
+  // STEP 3: PERSISTENCE & SYNC STATES
+  // ----------------------------------------------------------
+
+  bool isLoadingEarlier = false;
+  bool hasEarlierMessages = true;
+  String? offlineNotice;
+  ChatMessage? pendingRetryMessage;
+
   // ==========================================================
-  // LOCAL HISTORY PERSISTENCE
+  // LOCAL HISTORY PERSISTENCE (SQLITE)
   // ==========================================================
 
   Future<void> _loadLocalHistory() async {
-    final cached = await LocalStorageService.getLocalChatHistory(elderId);
-    if (cached.isNotEmpty && mounted) {
+    final cached = await LocalStorageService.getChatHistory(
+      elderId: elderId,
+      limit: 30,
+    );
+    if (mounted) {
       setState(() {
         messages.clear();
         for (final item in cached) {
           messages.add(
             ChatMessage(
-              text: item['text'] ?? '',
-              isUser: item['is_user'] == true,
-              audioUrl: item['audio_url'],
+              id: item['id']?.toString(),
+              elderId: item['elder_id']?.toString() ?? elderId,
+              sessionId: item['session_id']?.toString() ?? sessionId,
+              text: item['text']?.toString() ?? '',
+              isUser: (item['role'] == 'user' || item['is_user'] == true),
+              audioUrl: item['audio_url']?.toString(),
               timestamp: item['timestamp'] != null
-                  ? DateTime.tryParse(item['timestamp']) ?? DateTime.now()
+                  ? DateTime.tryParse(item['timestamp'].toString()) ?? DateTime.now()
                   : DateTime.now(),
+              syncStatus: item['sync_status']?.toString() ?? 'synced',
             ),
           );
         }
+        hasEarlierMessages = cached.length >= 30;
       });
       scrollToBottom();
+
+      // Trigger duplicate-safe sync for any offline messages
+      _triggerBackgroundSync();
     }
   }
 
-  void _persistLocalHistory() {
-    final list = messages.map((m) => {
-      'text': m.text,
-      'is_user': m.isUser,
-      'audio_url': m.audioUrl,
-      'timestamp': m.timestamp.toIso8601String(),
-    }).toList();
-    LocalStorageService.saveLocalChatHistory(elderId, list);
+  Future<void> _loadEarlierMessages() async {
+    if (isLoadingEarlier || messages.isEmpty) return;
+    setState(() => isLoadingEarlier = true);
+
+    try {
+      final oldestTime = messages.first.timestamp;
+      final earlier = await LocalStorageService.getEarlierMessages(
+        elderId: elderId,
+        beforeTimestamp: oldestTime,
+        limit: 20,
+      );
+
+      if (mounted) {
+        setState(() {
+          if (earlier.isEmpty) {
+            hasEarlierMessages = false;
+          } else {
+            final prepended = earlier.map((item) {
+              return ChatMessage(
+                id: item['id']?.toString(),
+                elderId: item['elder_id']?.toString() ?? elderId,
+                sessionId: item['session_id']?.toString() ?? sessionId,
+                text: item['text']?.toString() ?? '',
+                isUser: (item['role'] == 'user' || item['is_user'] == true),
+                audioUrl: item['audio_url']?.toString(),
+                timestamp: item['timestamp'] != null
+                    ? DateTime.tryParse(item['timestamp'].toString()) ?? DateTime.now()
+                    : DateTime.now(),
+                syncStatus: item['sync_status']?.toString() ?? 'synced',
+              );
+            }).toList();
+
+            messages.insertAll(0, prepended);
+            if (earlier.length < 20) {
+              hasEarlierMessages = false;
+            }
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint("Error loading earlier messages: $e");
+    } finally {
+      if (mounted) {
+        setState(() => isLoadingEarlier = false);
+      }
+    }
+  }
+
+  Future<void> _triggerBackgroundSync() async {
+    if (token.isEmpty) return;
+    try {
+      await LocalStorageService.syncPendingQueue(
+        elderId: elderId,
+        token: token,
+        baseUrl: baseUrl,
+      );
+    } catch (_) {}
   }
 
   // ==========================================================
@@ -462,39 +542,76 @@ class _ElderCareHomeState extends State<ElderCareHome>
   // SEND MESSAGE TO BACKEND
   // ==========================================================
 
-  Future<void> sendMessage() async {
-    final text = messageController.text.trim();
+  Future<void> sendMessage({ChatMessage? retryMsg}) async {
+    final text = retryMsg != null
+        ? retryMsg.text
+        : messageController.text.trim();
     if (text.isEmpty || isThinking) return;
 
-    // Stop speaking or listening if active
-    if (isListening) {
-      await speechToText.stop();
-      setState(() => isListening = false);
-    }
-    if (isSpeaking) {
-      await stopSpeaking();
+    if (retryMsg == null) {
+      // Stop speaking or listening if active
+      if (isListening) {
+        await speechToText.stop();
+        setState(() => isListening = false);
+      }
+      if (isSpeaking) {
+        await stopSpeaking();
+      }
     }
 
-    setState(() {
-      messages.add(
+    final userMsgId = retryMsg?.id ??
+        'msg_${elderId}_${DateTime.now().millisecondsSinceEpoch}_u';
+    final userMsg = retryMsg ??
         ChatMessage(
+          id: userMsgId,
+          elderId: elderId,
+          sessionId: sessionId,
           text: text,
           isUser: true,
-        ),
-      );
-      isThinking = true;
-    });
-    _persistLocalHistory();
+          timestamp: DateTime.now(),
+          syncStatus: 'pending',
+        );
 
-    messageController.clear();
-    scrollToBottom();
+    // 1. SAVE USER MESSAGE TO SQLITE BEFORE NETWORK REQUEST
+    await LocalStorageService.saveChatMessage(
+      id: userMsg.id,
+      elderId: userMsg.elderId,
+      sessionId: userMsg.sessionId,
+      role: 'user',
+      text: userMsg.text,
+      timestamp: userMsg.timestamp,
+      syncStatus: 'pending',
+    );
+
+    if (retryMsg == null) {
+      setState(() {
+        messages.add(userMsg);
+        isThinking = true;
+        offlineNotice = null;
+        pendingRetryMessage = null;
+      });
+      messageController.clear();
+      scrollToBottom();
+    } else {
+      setState(() {
+        isThinking = true;
+        offlineNotice = null;
+        pendingRetryMessage = null;
+      });
+    }
 
     try {
-      // Include past conversation history for continuous multi-turn dialogue
-      final historyList = messages.take(messages.length - 1).map((m) => {
-        "role": m.isUser ? "user" : "model",
-        "text": m.text,
-      }).toList();
+      // 2. Strict conversation context for Gemini: current elder & session only
+      final matching = messages
+          .where((m) => m.elderId == elderId && m.sessionId == sessionId && m.id != userMsg.id)
+          .toList();
+      final recentHistory = matching.length > 10 ? matching.sublist(matching.length - 10) : matching;
+      final historyList = recentHistory
+          .map((m) => {
+                "role": m.isUser ? "user" : "model",
+                "text": m.text,
+              })
+          .toList();
 
       final response = await http.post(
         Uri.parse(chatUrl),
@@ -507,39 +624,89 @@ class _ElderCareHomeState extends State<ElderCareHome>
           "history": historyList,
           "elder_id": elderId,
           "session_id": sessionId,
+          "message_id": userMsg.id,
         }),
-      );
+      ).timeout(const Duration(seconds: 35));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final String reply = data["response"] ??
             "ക്ഷമിക്കണം അപ്പൂപ്പാ, എനിക്ക് മറുപടി നൽകാൻ കഴിഞ്ഞില്ല.";
         final String? audioUrl = data["audio_url"];
+        final String assistantMsgId = data["message_id"] ??
+            'msg_${elderId}_${DateTime.now().millisecondsSinceEpoch}_a';
 
-        setState(() {
-          messages.add(
-            ChatMessage(
-              text: reply,
-              isUser: false,
-              audioUrl: audioUrl,
-            ),
-          );
-          isThinking = false;
-        });
-        _persistLocalHistory();
+        // 3. Mark user message as synced in SQLite
+        await LocalStorageService.markMessageSynced(userMsg.id);
 
-        scrollToBottom();
+        // 4. Save Gemini response to SQLite
+        final assistantMsg = ChatMessage(
+          id: assistantMsgId,
+          elderId: elderId,
+          sessionId: sessionId,
+          text: reply,
+          isUser: false,
+          audioUrl: audioUrl,
+          timestamp: DateTime.now(),
+          syncStatus: 'synced',
+        );
 
-        // Speak the response using the synchronized TTS engine
-        await playSpeech(reply, audioUrl: audioUrl);
+        await LocalStorageService.saveChatMessage(
+          id: assistantMsg.id,
+          elderId: assistantMsg.elderId,
+          sessionId: assistantMsg.sessionId,
+          role: 'assistant',
+          text: assistantMsg.text,
+          audioUrl: assistantMsg.audioUrl,
+          timestamp: assistantMsg.timestamp,
+          syncStatus: 'synced',
+        );
+
+        if (mounted) {
+          setState(() {
+            // Update user message sync status in UI
+            final idx = messages.indexWhere((m) => m.id == userMsg.id);
+            if (idx != -1) {
+              messages[idx] = ChatMessage(
+                id: userMsg.id,
+                elderId: userMsg.elderId,
+                sessionId: userMsg.sessionId,
+                text: userMsg.text,
+                isUser: userMsg.isUser,
+                timestamp: userMsg.timestamp,
+                syncStatus: 'synced',
+              );
+            }
+            messages.add(assistantMsg);
+            isThinking = false;
+            offlineNotice = null;
+            pendingRetryMessage = null;
+          });
+          scrollToBottom();
+
+          // Sync any previously queued offline records
+          _triggerBackgroundSync();
+
+          // Speak the response using the synchronized TTS engine
+          await playSpeech(reply, audioUrl: audioUrl);
+        }
       } else {
-        debugPrint("Server error: ${response.statusCode}");
-        showConnectionError();
+        _handleChatNetworkFailure(userMsg);
       }
     } catch (e) {
-      debugPrint("Connection error: $e");
-      showConnectionError();
+      _handleChatNetworkFailure(userMsg);
     }
+  }
+
+  void _handleChatNetworkFailure(ChatMessage userMsg) {
+    if (!mounted) return;
+    setState(() {
+      isThinking = false;
+      offlineNotice =
+          "ഇന്റർനെറ്റ് ലഭ്യമല്ല. ചോദ്യം സേവ് ചെയ്തിട്ടുണ്ട്. താഴെ തൊട്ട് വീണ്ടും ശ്രമിക്കാം.";
+      pendingRetryMessage = userMsg;
+    });
+    scrollToBottom();
   }
 
   // ==========================================================
@@ -556,15 +723,12 @@ class _ElderCareHomeState extends State<ElderCareHome>
 
     final thisToken = ++_speechToken;
 
-    // Safely stop any previous playback
-    try {
-      await audioPlayer.stop();
-    } catch (_) {}
+    // Safely stop any ongoing speech synthesis
     try {
       await flutterTts.stop();
     } catch (_) {}
 
-    // If another speech action started while stopping, bail out cleanly
+    // If another speech action started, bail out cleanly
     if (_speechToken != thisToken) return;
 
     bool streamStarted = false;
@@ -576,38 +740,28 @@ class _ElderCareHomeState extends State<ElderCareHome>
         streamUrl = audioUrl.startsWith('http')
             ? audioUrl
             : '$baseUrl$audioUrl';
-        // Add fallback_text query param so backend never returns 404 even if cache expired
-        if (!streamUrl.contains('fallback_text=')) {
-          final separator = streamUrl.contains('?') ? '&' : '?';
-          streamUrl = '$streamUrl${separator}fallback_text=${Uri.encodeComponent(cleanText)}';
-        }
       } else {
         streamUrl = '$baseUrl/api/tts?text=${Uri.encodeComponent(cleanText)}';
       }
 
       if (_speechToken != thisToken) return;
+
+      try {
+        await audioPlayer.setVolume(1.0);
+      } catch (_) {}
+
       await audioPlayer.play(UrlSource(streamUrl));
       if (_speechToken == thisToken) {
         streamStarted = true;
       }
     } catch (e) {
-      final errString = e.toString().toLowerCase();
-      // In Chrome/HTML5, calling stop() or page reloading rejects play() with AbortError.
-      // This is an intentional cancellation, NOT a network/TTS failure that needs fallback.
-      final isAbort = errString.contains('abort') ||
-          errString.contains('interrupted') ||
-          errString.contains('pause');
-
-      if (isAbort || _speechToken != thisToken) {
-        debugPrint("Speech playback safely interrupted or cancelled: $e");
-        return;
-      }
-
-      debugPrint("AudioPlayer stream playback error: $e. Falling back to flutter_tts.");
+      debugPrint("AudioPlayer stream playback failed: $e. Checking fallback.");
+      // Only abort if user triggered a NEW speech request
+      if (_speechToken != thisToken) return;
       streamStarted = false;
     }
 
-    // 2. Immediate fallback to local flutter_tts ONLY if stream truly failed and wasn't cancelled
+    // 2. Immediate fallback to local flutter_tts ONLY if stream failed and wasn't superseded
     if (!streamStarted && _speechToken == thisToken) {
       try {
         await flutterTts.speak(cleanText);
@@ -702,9 +856,42 @@ class _ElderCareHomeState extends State<ElderCareHome>
                       )
                     : ListView.builder(
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                        itemCount: messages.length,
+                        itemCount: messages.length + (hasEarlierMessages ? 1 : 0),
                         itemBuilder: (context, index) {
-                          final msg = messages[index];
+                          if (hasEarlierMessages && index == 0) {
+                            return Center(
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 8),
+                                child: isLoadingEarlier
+                                    ? const SizedBox(
+                                        width: 24,
+                                        height: 24,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Color(0xFF4D8F80),
+                                        ),
+                                      )
+                                    : TextButton.icon(
+                                        onPressed: _loadEarlierMessages,
+                                        icon: const Icon(Icons.history, size: 18, color: Color(0xFF315D54)),
+                                        label: const Text(
+                                          "പഴയ സന്ദേശങ്ങൾ കാണുക (Load Earlier)",
+                                          style: TextStyle(
+                                            color: Color(0xFF315D54),
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 13,
+                                          ),
+                                        ),
+                                      ),
+                              ),
+                            );
+                          }
+
+                          final msgIndex = hasEarlierMessages ? index - 1 : index;
+                          final msg = messages[msgIndex];
+                          final timeStr =
+                              "${msg.timestamp.hour.toString().padLeft(2, '0')}:${msg.timestamp.minute.toString().padLeft(2, '0')}";
+
                           return Align(
                             alignment: msg.isUser
                                 ? Alignment.centerRight
@@ -728,42 +915,76 @@ class _ElderCareHomeState extends State<ElderCareHome>
                                   ),
                                 ],
                               ),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
+                              child: Column(
+                                crossAxisAlignment: msg.isUser
+                                    ? CrossAxisAlignment.end
+                                    : CrossAxisAlignment.start,
                                 children: [
-                                  Flexible(
-                                    child: Text(
-                                      msg.text,
-                                      style: TextStyle(
-                                        fontSize: 15,
-                                        height: 1.42,
-                                        color: msg.isUser
-                                            ? const Color(0xFF1E3833)
-                                            : const Color(0xFF2C3E3A),
+                                  Row(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Flexible(
+                                        child: Text(
+                                          msg.text,
+                                          style: TextStyle(
+                                            fontSize: 15,
+                                            height: 1.42,
+                                            color: msg.isUser
+                                                ? const Color(0xFF1E3833)
+                                                : const Color(0xFF2C3E3A),
+                                          ),
+                                        ),
                                       ),
-                                    ),
+                                      if (!msg.isUser) ...[
+                                        const SizedBox(width: 8),
+                                        GestureDetector(
+                                          onTap: () {
+                                            playSpeech(msg.text, audioUrl: msg.audioUrl);
+                                          },
+                                          child: Container(
+                                            padding: const EdgeInsets.all(6),
+                                            decoration: const BoxDecoration(
+                                              color: Color(0xFFE8F4F1),
+                                              shape: BoxShape.circle,
+                                            ),
+                                            child: const Icon(
+                                              Icons.volume_up,
+                                              size: 18,
+                                              color: Color(0xFF4D8F80),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ],
                                   ),
-                                  if (!msg.isUser) ...[
-                                    const SizedBox(width: 8),
-                                    GestureDetector(
-                                      onTap: () {
-                                        playSpeech(msg.text, audioUrl: msg.audioUrl);
-                                      },
-                                      child: Container(
-                                        padding: const EdgeInsets.all(6),
-                                        decoration: const BoxDecoration(
-                                          color: Color(0xFFE8F4F1),
-                                          shape: BoxShape.circle,
-                                        ),
-                                        child: const Icon(
-                                          Icons.volume_up,
-                                          size: 18,
-                                          color: Color(0xFF4D8F80),
+                                  const SizedBox(height: 5),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        timeStr,
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color: msg.isUser
+                                              ? const Color(0xFF437166)
+                                              : Colors.black38,
                                         ),
                                       ),
-                                    ),
-                                  ],
+                                      if (msg.isUser) ...[
+                                        const SizedBox(width: 4),
+                                        Icon(
+                                          msg.syncStatus == 'synced'
+                                              ? Icons.done_all
+                                              : Icons.cloud_queue,
+                                          size: 13,
+                                          color: msg.syncStatus == 'synced'
+                                              ? const Color(0xFF315D54)
+                                              : const Color(0xFFE65100),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
                                 ],
                               ),
                             ),
@@ -1202,6 +1423,53 @@ class _ElderCareHomeState extends State<ElderCareHome>
                           ),
                         ),
                       ],
+                    ],
+                  ),
+                ),
+              ),
+
+            if (offlineNotice != null)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFF3E0),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFFFFB74D)),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.04),
+                        blurRadius: 6,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.cloud_off, color: Color(0xFFE65100), size: 22),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          offlineNotice!,
+                          style: const TextStyle(
+                            color: Color(0xFFBF360C),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      if (pendingRetryMessage != null)
+                        TextButton(
+                          onPressed: () => sendMessage(retryMsg: pendingRetryMessage),
+                          style: TextButton.styleFrom(
+                            backgroundColor: const Color(0xFFE65100),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                          child: const Text("ശ്രമിക്കുക", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                        ),
                     ],
                   ),
                 ),

@@ -121,8 +121,10 @@ class SentimentRecord(BaseModel):
 # ==============================================================================
 
 class MedicationDosageSchedule(BaseModel):
-    time_of_day: str = Field(..., description="e.g. '08:00 AM', 'After Breakfast'")
-    dose: str = Field(..., description="e.g. '1 tablet', '5 ml'")
+    time_of_day: Optional[str] = Field(default="08:00 AM", description="e.g. '08:00 AM', 'After Breakfast'")
+    dose: Optional[str] = Field(default="1 dose", description="e.g. '1 tablet', '5 ml'")
+    time: Optional[str] = None
+    meal_relation: Optional[str] = None
     special_instructions: Optional[str] = Field(default=None, description="e.g. 'Take with water before food'")
 
 
@@ -214,3 +216,92 @@ class SyncBatchResponse(BaseModel):
     synced_operations: List[str]  # operation_ids successfully processed
     rejected_operations: List[Dict[str, str]] = []  # operation_id -> reason
     server_time: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+# ==============================================================================
+# 8. CAREGIVER ACCOUNTS, PROFILES & DASHBOARD SCHEMAS
+# ==============================================================================
+
+class CaregiverRole(str, Enum):
+    FAMILY = "family"
+    NURSE = "nurse"
+    OTHER = "other"
+
+
+class CaregiverSignupRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., min_length=5, max_length=100)
+    password: str = Field(..., min_length=6)
+    phone: Optional[str] = None
+    role: str = "family"
+
+
+class CaregiverLoginRequest(BaseModel):
+    email: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class CaregiverProfile(BaseModel):
+    caregiver_id: str
+    name: str
+    email: str
+    phone: Optional[str] = None
+    role: str = "family"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    is_active: bool = True
+
+
+class CaregiverInDB(CaregiverProfile):
+    hashed_password: str
+
+
+class CaregiverAuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    caregiver: CaregiverProfile
+    expires_in_days: int = 30
+
+
+class LinkElderRequest(BaseModel):
+    caregiver_linking_code: str = Field(..., min_length=3, max_length=50)
+
+
+class CaregiverMedicationCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    dosage: str = Field(..., min_length=1)
+    times: Optional[List[str]] = None
+    diet: Optional[str] = None
+    schedules: Optional[List[MedicationDosageSchedule]] = None
+    instructions: Optional[str] = None
+    prescribed_by: Optional[str] = None
+
+
+class CaregiverMedicationLogCreate(BaseModel):
+    medicine_id: str
+    medicine_name: str
+    scheduled_time: str
+    taken_status: str = Field(default="taken", description="'taken', 'missed', 'snoozed', 'skipped'")
+    notes: Optional[str] = None
+
+
+class CaregiverReminderCreate(BaseModel):
+    title: str = Field(..., min_length=1)
+    time: str = Field(..., min_length=1, description="HH:MM format, e.g. 08:00")
+    type: str = Field(default="Supplement", description="'Supplement', 'Wellness', 'Routine'")
+    dose: str = Field(default="", description="e.g. 500mg • After Breakfast")
+
+
+class CaregiverHealthDiaryCreate(BaseModel):
+    date: str = Field(..., description="YYYY-MM-DD")
+    mood_rating: Optional[int] = Field(default=None, ge=1, le=5)
+    sleep_quality: Optional[str] = Field(default=None)
+    pain_level: Optional[int] = Field(default=None, ge=0, le=10)
+    notes: Optional[str] = None
+
+
+class CaregiverCopilotChatRequest(BaseModel):
+    elder_id: str
+    message: str
+    history: Optional[List[Dict[str, str]]] = None
+

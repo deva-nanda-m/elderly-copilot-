@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Response, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from google import genai
@@ -26,6 +27,7 @@ try:
         save_sentiment_record,
     )
     from auth import auth_router
+    from caregiver.router import router as caregiver_router
     from database import get_central_db, ChatMessageRecord, MessageRole
 except ImportError:
     from backend.sentiment import (
@@ -35,6 +37,7 @@ except ImportError:
         save_sentiment_record,
     )
     from backend.auth import auth_router
+    from backend.caregiver.router import router as caregiver_router
     from backend.database import get_central_db, ChatMessageRecord, MessageRole
 
 # ---------------------------------------------------------
@@ -97,6 +100,14 @@ app.include_router(sentiment_router)
 get_central_db()
 app.include_router(auth_router)
 
+# Mount caregiver router
+app.include_router(caregiver_router)
+
+# Mount caregiver web dashboard static files
+dashboard_dir = Path(__file__).resolve().parent.parent / "caregiver-dashboard"
+if dashboard_dir.exists():
+    app.mount("/dashboard", StaticFiles(directory=str(dashboard_dir), html=True), name="dashboard")
+
 
 # ---------------------------------------------------------
 # REQUEST / RESPONSE MODELS
@@ -112,11 +123,15 @@ class ChatRequest(BaseModel):
     history: Optional[list[ChatMessageItem]] = None
     elder_id: Optional[str] = "default_elder"
     session_id: Optional[str] = None
+    message_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     response: str
     audio_url: Optional[str] = None
+    message_id: Optional[str] = None
+    session_id: Optional[str] = None
+    timestamp: Optional[str] = None
 
 
 class TtsRequest(BaseModel):
@@ -141,7 +156,9 @@ LANGUAGE & CONVERSATION:
 - Speak pure, natural, sweet conversational Malayalam by default.
 - If the user speaks English, respond in English with the same loving, cheerful grandson personality.
 - Speak in complete, clear, and melodious sentences that flow naturally when read aloud by text-to-speech.
-- Provide generous, comforting, and expressive conversations (aim for 4 to 8 sweet, engaging, and connected sentences per response).
+- Keep responses warm, comforting, and concise: provide between 2 and 4 sentences, and strictly never exceed 5 sentences in total.
+- Ensure all sentences are logically connected and make complete sense together.
+- Always conclude every sentence and thought cleanly with terminal punctuation (. or ?). Never leave a sentence unfinished or cut off mid-sentence.
 - Forgive regional Malayalam accents, colloquial phrases, and minor speech-to-text transcript errors naturally without questioning or confusing the elder.
 - Do NOT use markdown asterisks (*, **), bullet points, hashtags (#), or emojis in your responses, as every word will be read aloud through speech synthesis.
 
@@ -343,12 +360,22 @@ async def _analyze_utterance_in_background(text: str, elder_id: str, session_id:
         print(f"Background sentiment analysis error: {err}")
 
 
-def _record_messages_to_central_db(elder_id: str, session_id: str, user_text: str, assistant_text: str, audio_url: str):
+def _record_messages_to_central_db(
+    elder_id: str,
+    session_id: str,
+    user_text: str,
+    assistant_text: str,
+    audio_url: str,
+    user_message_id: Optional[str] = None,
+    assistant_message_id: Optional[str] = None,
+):
     try:
         db = get_central_db()
         now_iso = datetime.now(timezone.utc).isoformat()
+        u_id = user_message_id or f"msg_{elder_id}_{int(datetime.now(timezone.utc).timestamp()*1000)}_u"
+        a_id = assistant_message_id or f"msg_{elder_id}_{int(datetime.now(timezone.utc).timestamp()*1000)}_a"
         u_msg = ChatMessageRecord(
-            id=f"msg_{int(datetime.now(timezone.utc).timestamp()*1000)}_u",
+            id=u_id,
             elder_id=elder_id,
             session_id=session_id,
             role=MessageRole.USER,
@@ -357,7 +384,7 @@ def _record_messages_to_central_db(elder_id: str, session_id: str, user_text: st
         )
         db.save_chat_message(u_msg)
         a_msg = ChatMessageRecord(
-            id=f"msg_{int(datetime.now(timezone.utc).timestamp()*1000)}_a",
+            id=a_id,
             elder_id=elder_id,
             session_id=session_id,
             role=MessageRole.ASSISTANT,
@@ -390,7 +417,13 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
 
     try:
         response = None
-        candidate_models = [MODEL_NAME, "gemini-3.5-flash", "gemini-3.8-flash"]
+        candidate_models = [
+            MODEL_NAME,
+            "gemini-3.5-flash-lite",
+            "gemini-3.7-flash",
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+        ]
         # Deduplicate while preserving order
         candidate_models = list(dict.fromkeys(candidate_models))
 
@@ -408,35 +441,61 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             parts=[types.Part.from_text(text=request.message.strip())]
         ))
 
+        reply_text = ""
         for m in candidate_models:
             try:
-                response = client.models.generate_content(
-                    model=m,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        temperature=0.7,
-                        max_output_tokens=2500,
-                    ),
-                )
+                def _invoke(model_name=m):
+                    return client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            temperature=0.7,
+                            max_output_tokens=450,
+                        ),
+                    )
+
+                response = await asyncio.to_thread(_invoke)
                 if response and response.text:
+                    reply_text = response.text.strip()
                     break
             except Exception as model_err:
                 print(f"Model {m} failed: {model_err}")
                 continue
 
-        if not response or not response.text:
+        if not reply_text:
             raise RuntimeError("All candidate models failed to return a response.")
 
-        reply_text = response.text or "ക്ഷമിക്കണം അപ്പൂപ്പാ, എനിക്ക് മറുപടി നൽകാൻ കഴിഞ്ഞില്ല."
+        # Enforce maximum 5 complete sentences, make sense together, and never cut off mid-sentence
+        complete_sentences = [
+            s.strip() for s in re.findall(r'[^.!?।]+[.!?।]+', reply_text) if s.strip()
+        ]
+        if complete_sentences:
+            # Strictly limit to maximum 5 complete sentences
+            reply_text = " ".join(complete_sentences[:5]).strip()
+        elif reply_text and reply_text[-1] not in ('.', '!', '?', '।', '"', "'"):
+            last_punct = max(reply_text.rfind('.'), reply_text.rfind('!'), reply_text.rfind('?'), reply_text.rfind('।'))
+            if last_punct > 15:
+                reply_text = reply_text[:last_punct + 1].strip()
 
         # Cache text with deterministic SHA256 hash so replays always find cached audio
-        audio_id = hashlib.sha256(reply_text.strip().encode("utf-8")).hexdigest()[:16]
+        audio_id = hashlib.sha256(reply_text.encode("utf-8")).hexdigest()[:16]
         tts_text_cache[audio_id] = reply_text
         if len(tts_text_cache) > 400:
             tts_text_cache.pop(next(iter(tts_text_cache)), None)
 
         audio_url = f"/api/tts/stream/{audio_id}"
+
+        # Pre-synthesize and cache audio bytes right away for instantaneous client audio streaming
+        try:
+            audio_bytes = await _generate_tts_audio(reply_text)
+            audio_data_cache[audio_id] = audio_bytes
+            if len(audio_data_cache) > 400:
+                audio_data_cache.pop(next(iter(audio_data_cache)), None)
+        except Exception as tts_err:
+            print(f"Pre-generating TTS audio warning: {tts_err}")
+
+        assistant_message_id = f"msg_{elder_id}_{int(datetime.now(timezone.utc).timestamp()*1000)}_a"
 
         # Persist conversation to central database asynchronously
         background_tasks.add_task(
@@ -446,11 +505,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             request.message.strip(),
             reply_text,
             audio_url,
+            request.message_id,
+            assistant_message_id,
         )
 
         return ChatResponse(
             response=reply_text,
-            audio_url=audio_url
+            audio_url=audio_url,
+            message_id=assistant_message_id,
+            session_id=session_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
     except Exception as e:

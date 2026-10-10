@@ -29,6 +29,8 @@ from .schemas import (
     CareCheckinRecord,
     SyncOperation,
     SyncBatchResponse,
+    CaregiverInDB,
+    CaregiverProfile,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,6 +155,43 @@ class CentralDatabase:
                     entity_id TEXT NOT NULL,
                     client_timestamp TEXT NOT NULL,
                     server_timestamp TEXT NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS caregivers (
+                    caregiver_id TEXT PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    hashed_password TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    phone TEXT,
+                    role TEXT NOT NULL DEFAULT 'family',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS caregiver_elder_links (
+                    caregiver_id TEXT NOT NULL,
+                    elder_id TEXT NOT NULL,
+                    linked_at TEXT NOT NULL,
+                    PRIMARY KEY (caregiver_id, elder_id),
+                    FOREIGN KEY (caregiver_id) REFERENCES caregivers(caregiver_id),
+                    FOREIGN KEY (elder_id) REFERENCES elders(elder_id)
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id TEXT PRIMARY KEY,
+                    elder_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    type TEXT NOT NULL DEFAULT 'Supplement',
+                    dose TEXT NOT NULL DEFAULT '',
+                    done INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (elder_id) REFERENCES elders(elder_id)
                 );
             """)
             conn.commit()
@@ -316,6 +355,8 @@ class CentralDatabase:
                 results.append(ChatMessageRecord(**d))
             return results
 
+    get_chat_history_for_elder = get_chat_history
+
     # ==========================================================================
     # MEDICINES & SCHEDULES
     # ==========================================================================
@@ -468,6 +509,240 @@ class CentralDatabase:
             rejected_operations=rejected,
             server_time=now_iso,
         )
+
+    # ==========================================================================
+    # CAREGIVER ACCOUNTS & AUTHORIZATION
+    # ==========================================================================
+
+    def save_caregiver(self, caregiver: CaregiverInDB) -> CaregiverProfile:
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO caregivers 
+                (caregiver_id, email, hashed_password, name, phone, role, created_at, updated_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                caregiver.caregiver_id,
+                caregiver.email.strip().lower(),
+                caregiver.hashed_password,
+                caregiver.name.strip(),
+                caregiver.phone,
+                caregiver.role,
+                caregiver.created_at,
+                caregiver.updated_at,
+                1 if caregiver.is_active else 0,
+            ))
+            conn.commit()
+
+        return CaregiverProfile(
+            caregiver_id=caregiver.caregiver_id,
+            email=caregiver.email,
+            name=caregiver.name,
+            phone=caregiver.phone,
+            role=caregiver.role,
+            created_at=caregiver.created_at,
+            updated_at=caregiver.updated_at,
+            is_active=caregiver.is_active,
+        )
+
+    def get_caregiver_by_email(self, email: str) -> Optional[CaregiverInDB]:
+        clean_email = email.strip().lower()
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT * FROM caregivers WHERE email = ?", (clean_email,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            data["is_active"] = bool(data["is_active"])
+            return CaregiverInDB(**data)
+
+    def get_caregiver_by_id(self, caregiver_id: str) -> Optional[CaregiverProfile]:
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT * FROM caregivers WHERE caregiver_id = ?", (caregiver_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            data.pop("hashed_password", None)
+            data["is_active"] = bool(data["is_active"])
+            return CaregiverProfile(**data)
+
+    def link_caregiver_to_elder(self, caregiver_id: str, elder_id: str) -> bool:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO caregiver_elder_links (caregiver_id, elder_id, linked_at)
+                VALUES (?, ?, ?)
+            """, (caregiver_id, elder_id, now_iso))
+            conn.commit()
+            return True
+
+    def get_elders_for_caregiver(self, caregiver_id: str) -> List[ElderProfile]:
+        """Returns only the elders authorized for / linked to this caregiver."""
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT e.* FROM elders e
+                JOIN caregiver_elder_links l ON e.elder_id = l.elder_id
+                WHERE l.caregiver_id = ? AND e.is_active = 1
+                ORDER BY e.name ASC
+            """, (caregiver_id,))
+            rows = cursor.fetchall()
+            
+            if not rows:
+                c_cursor = conn.execute("SELECT name FROM caregivers WHERE caregiver_id = ?", (caregiver_id,))
+                c_row = c_cursor.fetchone()
+                if c_row and c_row["name"]:
+                    c_name = c_row["name"].strip()
+                    cursor = conn.execute("""
+                        SELECT * FROM elders
+                        WHERE (caregiver_name LIKE ? OR caregiver_name = ?) AND is_active = 1
+                    """, (f"%{c_name}%", c_name))
+                    rows = cursor.fetchall()
+                    for r in rows:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        conn.execute("""
+                            INSERT OR IGNORE INTO caregiver_elder_links (caregiver_id, elder_id, linked_at)
+                            VALUES (?, ?, ?)
+                        """, (caregiver_id, r["elder_id"], now_iso))
+                    conn.commit()
+
+            res = []
+            for r in rows:
+                d = dict(r)
+                d.pop("hashed_password", None)
+                d["is_active"] = bool(d["is_active"])
+                res.append(ElderProfile(**d))
+            return res
+
+    def is_caregiver_authorized_for_elder(self, caregiver_id: str, elder_id: str) -> bool:
+        """Checks if the caregiver is authorized to access the specific elder's records."""
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            cursor = conn.execute("""
+                SELECT 1 FROM caregiver_elder_links
+                WHERE caregiver_id = ? AND elder_id = ?
+            """, (caregiver_id, elder_id))
+            if cursor.fetchone():
+                return True
+            cursor = conn.execute("""
+                SELECT e.elder_id FROM elders e
+                JOIN caregivers c ON c.caregiver_id = ?
+                WHERE e.elder_id = ? AND (e.caregiver_name LIKE '%' || c.name || '%' OR e.caregiver_name = c.name)
+            """, (caregiver_id, elder_id))
+            if cursor.fetchone():
+                return True
+            return False
+
+    # ==========================================================================
+    # MEDICATION LOGS, REMINDERS & HEALTH DIARY
+    # ==========================================================================
+
+    def get_medication_logs(self, elder_id: str, limit: int = 50) -> List[MedicationLog]:
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM medication_logs
+                WHERE elder_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (elder_id, limit))
+            res = []
+            for r in cursor.fetchall():
+                res.append(MedicationLog(**dict(r)))
+            return res
+
+    def save_medication_log(self, log: MedicationLog):
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO medication_logs
+                (id, elder_id, medicine_id, medicine_name, scheduled_time, taken_status, taken_at, notes, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                log.id, log.elder_id, log.medicine_id, log.medicine_name,
+                log.scheduled_time, log.taken_status, log.taken_at, log.notes, log.timestamp
+            ))
+            conn.commit()
+
+    def get_health_diary(self, elder_id: str, limit: int = 30) -> List[HealthDiaryEntry]:
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM health_diary
+                WHERE elder_id = ?
+                ORDER BY date DESC, recorded_at DESC
+                LIMIT ?
+            """, (elder_id, limit))
+            res = []
+            for r in cursor.fetchall():
+                res.append(HealthDiaryEntry(**dict(r)))
+            return res
+
+    def save_health_diary(self, entry: HealthDiaryEntry):
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO health_diary
+                (id, elder_id, date, mood_rating, sleep_quality, pain_level, notes, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entry.id, entry.elder_id, entry.date, entry.mood_rating,
+                entry.sleep_quality, entry.pain_level, entry.notes, entry.recorded_at
+            ))
+            conn.commit()
+
+    def get_reminders(self, elder_id: str) -> List[Dict[str, Any]]:
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM reminders
+                WHERE elder_id = ?
+                ORDER BY time ASC
+            """, (elder_id,))
+            res = []
+            for r in cursor.fetchall():
+                d = dict(r)
+                d["done"] = bool(d["done"])
+                res.append(d)
+            return res
+
+    def save_reminder(self, elder_id: str, title: str, time: str, type: str = "Supplement", dose: str = "", reminder_id: Optional[str] = None) -> Dict[str, Any]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        r_id = reminder_id or f"rem_{int(datetime.now(timezone.utc).timestamp()*1000)}"
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO reminders
+                (id, elder_id, title, time, type, dose, done, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """, (r_id, elder_id, title, time, type, dose, now_iso, now_iso))
+            conn.commit()
+        return {
+            "id": r_id,
+            "elder_id": elder_id,
+            "title": title,
+            "time": time,
+            "type": type,
+            "dose": dose,
+            "done": False,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+
+    def toggle_reminder(self, elder_id: str, reminder_id: str) -> Optional[Dict[str, Any]]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(str(self.sqlite_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT * FROM reminders WHERE id = ? AND elder_id = ?", (reminder_id, elder_id))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            current_done = bool(row["done"])
+            new_done = not current_done
+            conn.execute("UPDATE reminders SET done = ?, updated_at = ? WHERE id = ?", (1 if new_done else 0, now_iso, reminder_id))
+            conn.commit()
+            d = dict(row)
+            d["done"] = new_done
+            d["updated_at"] = now_iso
+            return d
 
 
 _global_central_db: Optional[CentralDatabase] = None
