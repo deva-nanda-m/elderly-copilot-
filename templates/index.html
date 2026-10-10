@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+    <h1>Drug Interaction Checker</h1>
+    <p>Check a new medicine against the elderly person's current medication list.</p>
+</section>
+
+<section class="card">
+    <h2>Check a New Medicine</h2>
+
+    <form method="POST" action="{{ url_for('check') }}">
+        <label for="new_medicine">Medicine name</label>
+        <input
+            id="new_medicine"
+            name="new_medicine"
+            placeholder="Example: Ibuprofen"
+            required
+        >
+        <button type="submit">Check Interactions</button>
+    </form>
+
+    <p class="hint">
+        Later, this form can be replaced or supplemented by medicine-photo OCR.
+    </p>
+</section>
+
+
+<section class="card">
+    <h2>Check Medicine from Photo</h2>
+    <p>Upload a clear photo of the medicine label or strip. The system will read the text, identify the medicine, and check it against the current medication list.</p>
+
+    <form method="POST"
+          action="{{ url_for('check_image') }}"
+          enctype="multipart/form-data">
+
+        <label for="medicine_image">Medicine photo</label>
+        <input
+            id="medicine_image"
+            name="medicine_image"
+            type="file"
+            accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+            required
+        >
+
+        <button type="submit">Identify &amp; Check Medicine</button>
+    </form>
+
+    <p class="hint">
+        For best OCR results, use a clear, well-lit photo where the medicine name is readable.
+    </p>
+</section>
+
+<section class="card">
+    <h2>Current Medicines</h2>
+
+    {% if medications %}
+        <ul class="medicine-list">
+        {% for medicine in medications %}
+            <li>
+                <strong>{{ medicine["medicine_name"] }}</strong>
+                {% if medicine["dose"] %} — {{ medicine["dose"] }}{% endif %}
+                {% if medicine["frequency"] %} — {{ medicine["frequency"] }}{% endif %}
+            </li>
+        {% endfor %}
+        </ul>
+    {% else %}
+        <p>No medicines have been added yet.</p>
+    {% endif %}
+
+    <a class="secondary-button" href="{{ url_for('medications') }}">
+        Manage Medicines
+    </a>
+</section>
+{% endblock %}

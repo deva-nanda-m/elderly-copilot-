@@ -1,0 +1,5 @@
+drug_a,drug_b,severity,effect,description,recommendation
+warfarin,ibuprofen,High,Increased bleeding risk,Using these medicines together may increase the risk of bleeding.,Consult a doctor or pharmacist before using these medicines together.
+warfarin,aspirin,High,Increased bleeding risk,Using these medicines together may increase the risk of bleeding.,Consult a doctor or pharmacist before using these medicines together.
+simvastatin,clarithromycin,High,Increased statin exposure,This combination can increase exposure to simvastatin and may increase the risk of adverse effects.,Consult a doctor or pharmacist before using these medicines together.
+metformin,cimetidine,Moderate,Possible change in metformin exposure,This combination may alter metformin exposure and requires professional review.,Ask a doctor or pharmacist whether additional monitoring is needed.
