@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>Medication List</h1>
+
+<section class="card">
+    <h2>Add Medicine</h2>
+
+    <form method="POST" action="{{ url_for('add_medication_route') }}">
+        <label for="medicine_name">Medicine name</label>
+        <input id="medicine_name" name="medicine_name" placeholder="Example: Warfarin" required>
+
+        <label for="dose">Dose</label>
+        <input id="dose" name="dose" placeholder="Example: 5 mg">
+
+        <label for="frequency">Frequency</label>
+        <input id="frequency" name="frequency" placeholder="Example: Once daily">
+
+        <button type="submit">Add Medicine</button>
+    </form>
+</section>
+
+<section class="card">
+    <h2>Current Medicines</h2>
+
+    {% if medications %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Medicine</th>
+                    <th>Dose</th>
+                    <th>Frequency</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for medicine in medications %}
+                <tr>
+                    <td>{{ medicine["medicine_name"] }}</td>
+                    <td>{{ medicine["dose"] or "-" }}</td>
+                    <td>{{ medicine["frequency"] or "-" }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p>No medicines added.</p>
+    {% endif %}
+</section>
+{% endblock %}

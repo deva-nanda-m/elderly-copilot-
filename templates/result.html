@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>Interaction Result</h1>
+
+<section class="card">
+    <p><strong>New medicine:</strong> {{ new_medicine }}</p>
+
+    <p><strong>Existing medicines checked:</strong></p>
+    <ul>
+        {% for medicine in existing %}
+            <li>{{ medicine }}</li>
+        {% else %}
+            <li>No existing medicines.</li>
+        {% endfor %}
+    </ul>
+</section>
+
+{% if new_medicine and existing and new_medicine|lower in (existing|map('lower')|list) %}
+<section class="card duplicate-warning">
+    <h2>⚠️ Medicine already listed</h2>
+    <p><strong>{{ new_medicine }}</strong> is already present in the patient's medication list.</p>
+    <p>The system will still perform the available interaction check, but the caregiver or healthcare professional should confirm whether another dose or duplicate entry is intended.</p>
+</section>
+{% endif %}
+
+{% if results %}
+    {% for result in results %}
+        <section class="card interaction {{ result['severity']|lower }}">
+            <h2>⚠️ Interaction Detected</h2>
+
+            <p>
+                <strong>{{ new_medicine }}</strong>
+                + 
+                <strong>{{ result["drug_a"] }}</strong>
+                /
+                <strong>{{ result["drug_b"] }}</strong>
+            </p>
+
+            <p>
+                <strong>Severity:</strong>
+                {{ result["severity"] }}
+            </p>
+
+            <p>
+                <strong>Potential effect:</strong>
+                {{ result["effect"] }}
+            </p>
+
+            <p>{{ result["description"] }}</p>
+
+            <div class="recommendation">
+                <strong>Recommendation:</strong><br>
+                {{ result["recommendation"] }}
+            </div>
+
+            <small>{{ result["source"] }}</small>
+        </section>
+    {% endfor %}
+{% else %}
+    <section class="card no-interaction">
+        <h2>✓ No matching interaction in database</h2>
+        <p>No matching interaction was found in the prototype's available interaction database for the medicines checked.</p>
+        <p><strong>Important:</strong> This does not guarantee that the combination is medically safe. The result should be verified with an appropriate clinical drug-interaction source or a healthcare professional.</p>
+    </section>
+{% endif %}
+
+<a class="secondary-button" href="{{ url_for('index') }}">
+    Check Another Medicine
+</a>
+{% endblock %}

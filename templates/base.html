@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elder Care DDI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<nav>
+    <div class="brand">Elder Care Copilot</div>
+    <div>
+        <a href="{{ url_for('index') }}">DDI Check</a>
+        <a href="{{ url_for('medications') }}">My Medicines</a>
+    </div>
+</nav>
+
+<main class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+</main>
+
+<footer>
+    Prototype for academic project — not a substitute for professional medical advice.
+</footer>
+</body>
+</html>
